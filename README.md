@@ -1,4 +1,6 @@
 # CalculatoRTX
+> Original code by DurianTheWAV, transfered me the ownership to the repo on 12.11.2026.
+> Original code is availible in the original_code branch
 
 A scientific calculator that is **fully ray traced**: every pixel of the interface (translucent
 shell with the electronics visible through it, keys, embossed legends, display digits, glass,
