@@ -34,7 +34,7 @@ std::string makeBadge(const Backend& b)
     for (char c : dev)
         if (c >= 32 && c < 127 && c != '|') clean += c;
     const bool nvidia = b.name().find("NVIDIA") != std::string::npos;
-    return clean + (nvidia ? "|OptiX|DLSS|CUDA" : "|Vulkan RT|FSR 1");
+    return clean + (nvidia ? "|OptiX|DLSS|CUDA" : (b.isLowEnd() ? "|SW BVH|FSR 1" : "|Vulkan RT|FSR 1"));
 }
 
 }  // namespace

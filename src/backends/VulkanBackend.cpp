@@ -59,15 +59,33 @@ public:
         vk_ = std::make_unique<VulkanContext>();
         vk_->createInstance({}, opt.validation, window == nullptr);
         DeviceRequest req;
-        req.rayTracing = true;
+        req.bufferDeviceAddress = true;
+        req.rayTracing = !opt.lowEnd;
         req.float64 = true;
-        try {
-            vk_->pickPhysicalDevice(req, opt.device);
-        } catch (const std::exception&) {
-            // GPU à ray tracing sans FP64 (Intel Arc) : rendu Vulkan, calcul sur le CPU
-            req.float64 = false;
-            vk_->pickPhysicalDevice(req, opt.device);
-            fp64_ = false;
+        auto pickWithFp64Fallback = [&](DeviceRequest& r) {
+            try {
+                vk_->pickPhysicalDevice(r, opt.device);
+                fp64_ = true;
+            } catch (const std::exception&) {
+                // GPU sans FP64 (ex. Intel Arc) : rendu Vulkan, calcul sur le CPU
+                r.float64 = false;
+                vk_->pickPhysicalDevice(r, opt.device);
+                fp64_ = false;
+            }
+        };
+        if (opt.lowEnd) {
+            lowEnd_ = true;
+            pickWithFp64Fallback(req);
+        } else {
+            try {
+                pickWithFp64Fallback(req);
+            } catch (const std::exception&) {
+                // Aucun GPU avec ray tracing matériel : repli en mode low-end (BVH logiciel)
+                req.rayTracing = false;
+                req.float64 = true;
+                pickWithFp64Fallback(req);
+                lowEnd_ = true;
+            }
         }
         vk_->createDevice(window, req);
         if (fp64_) {
@@ -85,7 +103,8 @@ public:
         VK_CHECK(vkAllocateCommandBuffers(vk_->device(), &ai, &cmd_));
         const char* vendor = vk_->vendorId() == 0x1002 ? "AMD" : vk_->vendorId() == 0x10DE ? "NVIDIA"
                            : vk_->vendorId() == 0x8086 ? "Intel" : "autre";
-        CRTX_LOG("Backend Vulkan : %s (%s), ray tracing VK_KHR_ray_query, AMD FSR 1", vk_->deviceName().c_str(), vendor);
+        CRTX_LOG("Backend Vulkan : %s (%s), %s, AMD FSR 1", vk_->deviceName().c_str(), vendor,
+                 lowEnd_ ? "mode low-end (ray tracing logiciel BVH)" : "ray tracing VK_KHR_ray_query");
     }
 
     ~VulkanBackend() override
@@ -99,6 +118,7 @@ public:
 
     std::string name() const override { return "Vulkan"; }
     std::string deviceName() const override { return vk_->deviceName(); }
+    bool isLowEnd() const override { return lowEnd_; }
     calc::ICalcEngine& calc() override { return *calc_; }
     int hoveredKey() const override { return hovered_; }
     bool idle() const override { return idle_; }
@@ -128,7 +148,7 @@ public:
             displayH_ = fbh;
         }
         renderer_->resize(displayW_, displayH_);
-        activeMode_ = mode_ == UpscaleMode::Auto ? autoMode(displayW_, displayH_) : mode_;
+        activeMode_ = mode_ == UpscaleMode::Auto ? (lowEnd_ ? UpscaleMode::Performance : autoMode(displayW_, displayH_)) : mode_;
         const float s = upscale_ ? fsrScale(activeMode_) : 1.0f;
         motionW_ = std::max(1u, static_cast<uint32_t>(std::lround(displayW_ / s)));
         motionH_ = std::max(1u, static_cast<uint32_t>(std::lround(displayH_ / s)));
@@ -156,6 +176,7 @@ private:
     std::unique_ptr<VkRenderer> renderer_;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     bool fp64_ = true;
+    bool lowEnd_ = false;
 
     uint32_t displayW_ = 0, displayH_ = 0, motionW_ = 0, motionH_ = 0;
     bool upscale_ = true;
@@ -180,15 +201,16 @@ bool VulkanBackend::frame(const FrameContext& ctx)
     if (ctx.changed) renderer_->resetAccumulation();
     const bool motionFrame = ctx.changed;
     const unsigned acc = renderer_->accumulated();
+    const unsigned targetSamples = lowEnd_ ? std::min(ctx.settings.convergedSamples, 256u) : ctx.settings.convergedSamples;
     const bool converged = !motionFrame && acc > 0 && renderer_->renderWidth() == displayW_ &&
-                           acc * staticSpp_ >= ctx.settings.convergedSamples;
+                           acc * staticSpp_ >= targetSamples;
     idle_ = converged;
 
     VkFrameDesc f;
     f.camera = ctx.camera;
     f.prevCamera = ctx.prevCamera;
     f.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
-    f.maxBounces = ctx.settings.maxBounces;
+    f.maxBounces = lowEnd_ ? std::min(ctx.settings.maxBounces, motionFrame ? 2u : 3u) : ctx.settings.maxBounces;
     f.fireflyClamp = ctx.settings.fireflyClamp;
     f.denoise = ctx.settings.denoise;
     f.exposure = ctx.post.exposure;
@@ -284,8 +306,9 @@ std::string VulkanBackend::stats(float fps) const
 {
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "CalculatoRTX | %s | Vulkan RT%s %ux%u -> %ux%u | %.0f ips | %s | PT %.2f ms | post %.2f ms | %u éch. | calcul %s",
-                  vk_->deviceName().c_str(), motionW_ != displayW_ ? " + FSR 1" : "", renderer_->renderWidth(),
+                  "CalculatoRTX | %s | %s%s %ux%u -> %ux%u | %.0f ips | %s | PT %.2f ms | post %.2f ms | %u éch. | calcul %s",
+                  vk_->deviceName().c_str(), lowEnd_ ? "Vulkan SW BVH" : "Vulkan RT",
+                  motionW_ != displayW_ ? " + FSR 1" : "", renderer_->renderWidth(),
                   renderer_->renderHeight(), displayW_, displayH_, fps, lastJob_, renderer_->lastTraceMs(),
                   renderer_->lastPostMs(), renderer_->accumulated() * staticSpp_, calc_->apiName());
     return buf;

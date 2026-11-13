@@ -21,12 +21,13 @@ namespace crtx {
 // Miroir exact de FrameParams (src/vk/shaders/Common.glsl), disposition scalar.
 struct VkFrameParams {
     uint64_t color, albedo, normal, depth, motion, materials, geometries, instances, lights, pickResult;
+    uint64_t tlasNodes, tlasIndices, swInstances;
     CameraData cam;
     CameraData prevCam;
     uint32_t width, height, frameIndex, accumCount, spp, maxBounces, flags, numLights;
     float jitterX, jitterY, envIntensity, pickX, pickY, pad0;
 };
-static_assert(sizeof(VkFrameParams) == 248, "VkFrameParams : disposition partagée avec les shaders");
+static_assert(sizeof(VkFrameParams) == 272, "VkFrameParams : disposition partagée avec les shaders");
 
 struct VkFrameDesc {
     CameraData camera;
@@ -83,6 +84,8 @@ private:
     struct MeshGpu {
         Buffer positions, normals, uvs, indices;
         Buffer asBuffer;
+        Buffer bvhNodes, bvhIndices;
+        float3 bmin = make_float3(0, 0, 0), bmax = make_float3(0, 0, 0);
         VkAccelerationStructureKHR blas = VK_NULL_HANDLE;
         VkDeviceAddress blasAddress = 0;
         bool alpha = false;
@@ -115,6 +118,7 @@ private:
     void writeParams(const VkFrameDesc& f);
 
     VulkanContext& vk_;
+    bool swRt_ = false;
     ComputePipeline trace_, pick_, envBake_, denoise_, bloomDown_, bloomBlur_, composite_, easu_, rcas_, pack_, temporal_;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     VkDescriptorSet traceSet_ = VK_NULL_HANDLE, pickSet_ = VK_NULL_HANDLE;
@@ -125,6 +129,7 @@ private:
     std::vector<Buffer> pendingDestroy_;
     std::vector<VkAccelerationStructureKHR> pendingDestroyAs_;
     Buffer tlasBuffer_, tlasScratch_, instanceBuffer_;
+    Buffer tlasNodes_, tlasIndices_, swInstances_;
     VkAccelerationStructureKHR tlas_ = VK_NULL_HANDLE;
     VkDeviceSize tlasCapacity_ = 0;
     Buffer materials_, geometries_, instances_, lights_, frameUbo_, pickBuf_;

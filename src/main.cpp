@@ -26,6 +26,7 @@ void usage()
         "  --no-dlss, --dlss-mode=   anciens noms de --no-upscale / --upscale-mode\n"
         "  --size=<L>x<H>            taille de fenêtre (défaut 1600x1000)\n"
         "  --no-vsync                présentation sans synchronisation verticale\n"
+        "  --low-end                 force le mode ray tracing logiciel (BVH compute, GPU sans RT matériel)\n"
         "  --device=<n>              index du GPU (CUDA ou Vulkan)\n"
         "  --validation              active les couches de validation Vulkan\n"
         "  --type=<touches>          touches tapées au démarrage (ex. \"s30+2^10*3=\")\n"
@@ -60,6 +61,7 @@ int main(int argc, char** argv)
         auto value = [&](const char* prefix) { return a.substr(std::strlen(prefix)); };
         if (a == "--no-dlss" || a == "--no-upscale") opt.backendOptions.upscale = false;
         else if (a == "--no-vsync") opt.backendOptions.vsync = false;
+        else if (a == "--low-end") opt.backendOptions.lowEnd = true;
         else if (a == "--validation") opt.backendOptions.validation = true;
         else if (a.rfind("--device=", 0) == 0) opt.backendOptions.device = std::atoi(value("--device=").c_str());
         else if (a.rfind("--backend=", 0) == 0) {

@@ -29,6 +29,7 @@ struct BackendOptions {
     bool validation = false;
     bool vsync = true;
     bool upscale = true;  // DLSS (NVIDIA) ou FSR 1 (Vulkan) pendant les mouvements
+    bool lowEnd = false;  // force le mode basse consommation (BVH logiciel, sans RT matériel)
     UpscaleMode mode = UpscaleMode::Auto;
     int device = -1;  // index du GPU (CUDA ou Vulkan), -1 = automatique
 };
@@ -69,6 +70,7 @@ public:
 
     virtual std::string name() const = 0;          // ex. "NVIDIA CUDA/OptiX", "Vulkan"
     virtual std::string deviceName() const = 0;
+    virtual bool isLowEnd() const { return false; }
     virtual calc::ICalcEngine& calc() = 0;
 
     // (Re)crée la swapchain et les tampons dépendant de la résolution.

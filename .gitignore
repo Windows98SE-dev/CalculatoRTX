@@ -7,3 +7,6 @@ out/
 CMakeUserPresets.json
 *.user
 *.swp
+.agents
+skills-lock.json
+.gemini

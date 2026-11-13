@@ -118,6 +118,8 @@ crtx_shader(g_spvCalc Calc.comp)
 crtx_shader(g_spvEnvBake EnvBake.comp)
 crtx_shader(g_spvPathTrace PathTrace.comp)
 crtx_shader(g_spvPick PathTrace.comp CRTX_PICK)
+crtx_shader(g_spvPathTraceSw PathTrace.comp CRTX_SW_RT)
+crtx_shader(g_spvPickSw PathTrace.comp CRTX_PICK CRTX_SW_RT)
 crtx_shader(g_spvDenoise Denoise.comp)
 crtx_shader(g_spvBloomDown Bloom.comp CRTX_BLOOM_DOWN)
 crtx_shader(g_spvBloomBlur Bloom.comp)
@@ -145,6 +147,7 @@ add_library(crtx_core STATIC
     src/scene/CalculatorScene.cpp
     src/scene/Mesh.cpp
     src/scene/StrokeFont.cpp
+    src/vk/SwBvh.cpp
     src/vk/VkCalcEngine.cpp
     src/vk/VkPipeline.cpp
     src/vk/VkRenderer.cpp

@@ -7,7 +7,9 @@
 // perforée par intersections candidates (géométrie non opaque), illumination globale.
 // Compilé deux fois : rendu (défaut) et sélection d'une touche sous le curseur (CRTX_PICK).
 #version 460
+#if !defined(CRTX_SW_RT)
 #extension GL_EXT_ray_query : require
+#endif
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
@@ -23,9 +25,14 @@ layout(local_size_x = 1) in;
 layout(local_size_x = 8, local_size_y = 8) in;
 #endif
 
+#if defined(CRTX_SW_RT)
+layout(set = 0, binding = 0) uniform sampler2D envTex;
+layout(set = 0, binding = 1, scalar) uniform FrameUbo { FrameParams fp; };
+#else
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1) uniform sampler2D envTex;
 layout(set = 0, binding = 2, scalar) uniform FrameUbo { FrameParams fp; };
+#endif
 
 struct Hit {
     vec3 P;       // position monde
@@ -74,6 +81,264 @@ bool cutoutHole(int instance, int prim, vec2 bc)
     return grilleSdf(uv) < 0.0;
 }
 
+#if defined(CRTX_SW_RT)
+vec3 safeInvRd(vec3 d)
+{
+    return vec3(abs(d.x) > 1e-8 ? 1.0 / d.x : (d.x >= 0.0 ? 1e8 : -1e8),
+                abs(d.y) > 1e-8 ? 1.0 / d.y : (d.y >= 0.0 ? 1e8 : -1e8),
+                abs(d.z) > 1e-8 ? 1.0 / d.z : (d.z >= 0.0 ? 1e8 : -1e8));
+}
+
+float intersectAabb(vec3 ro, vec3 invRd, vec3 bmin, vec3 bmax, float tMax)
+{
+    const vec3 t0 = (bmin - ro) * invRd;
+    const vec3 t1 = (bmax - ro) * invRd;
+    const vec3 tmin = min(t0, t1);
+    const vec3 tmax = max(t0, t1);
+    const float tNear = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+    const float tFar = min(min(tmax.x, tmax.y), min(tmax.z, tMax));
+    return tNear <= tFar ? tNear : 1e30;
+}
+
+bool intersectTri(vec3 ro, vec3 rd, vec3 p0, vec3 p1, vec3 p2, float tMax, out float t, out vec2 bc)
+{
+    const vec3 e1 = p1 - p0;
+    const vec3 e2 = p2 - p0;
+    const vec3 pvec = cross(rd, e2);
+    const float det = dot(e1, pvec);
+    if (abs(det) < 1e-12) return false;
+    const float invDet = 1.0 / det;
+    const vec3 tvec = ro - p0;
+    const float u = dot(tvec, pvec) * invDet;
+    if (u < 0.0 || u > 1.0) return false;
+    const vec3 qvec = cross(tvec, e1);
+    const float v = dot(rd, qvec) * invDet;
+    if (v < 0.0 || u + v > 1.0) return false;
+    const float tt = dot(e2, qvec) * invDet;
+    if (tt <= 0.0 || tt >= tMax) return false;
+    t = tt;
+    bc = vec2(u, v);
+    return true;
+}
+
+mat4x3 toMat4x3(float m[12])
+{
+    return mat4x3(vec3(m[0], m[4], m[8]), vec3(m[1], m[5], m[9]), vec3(m[2], m[6], m[10]), vec3(m[3], m[7], m[11]));
+}
+
+bool traceClosest(vec3 ro, vec3 rd, uint mask, out RawHit h)
+{
+    h.instance = -1;
+    h.prim = 0;
+    h.bc = vec2(0.0);
+    h.t = 0.0;
+    h.o2w = mat4x3(1.0);
+    h.w2o = mat4x3(1.0);
+    if (fp.tlasNodes == 0ul) return false;
+
+    BvhNodeBuf tNodes = BvhNodeBuf(fp.tlasNodes);
+    UintROBuf tIdx = UintROBuf(fp.tlasIndices);
+    SwInstanceBuf swInsts = SwInstanceBuf(fp.swInstances);
+    GeometryBuf geoms = GeometryBuf(fp.geometries);
+    const vec3 invRd = safeInvRd(rd);
+
+    float bestT = 1e16;
+    uint bestSw = 0u;
+    if (intersectAabb(ro, invRd, tNodes.n[0].bmin, tNodes.n[0].bmax, bestT) >= bestT) return false;
+
+    uint tStack[32];
+    int tSp = 0;
+    uint tNode = 0u;
+    for (;;) {
+        const BvhNode tn = tNodes.n[tNode];
+        if (tn.count > 0u) {
+            for (uint i = 0u; i < tn.count; ++i) {
+                const uint swId = tIdx.v[tn.leftFirst + i];
+                const SwInstance sw = swInsts.d[swId];
+                if ((sw.mask & mask) == 0u) continue;
+                const GeometryData g = geoms.g[sw.geometry];
+                if (g.bvhNodes == 0ul) continue;
+
+                const vec3 oro = xformPoint12(sw.worldToObject, ro);
+                const vec3 ord = xformVec12(sw.worldToObject, rd);
+                const vec3 oInvRd = safeInvRd(ord);
+                BvhNodeBuf bNodes = BvhNodeBuf(g.bvhNodes);
+                if (intersectAabb(oro, oInvRd, bNodes.n[0].bmin, bNodes.n[0].bmax, bestT) >= bestT) continue;
+
+                UintROBuf bIdx = UintROBuf(g.bvhIndices);
+                Vec3Buf pos = Vec3Buf(g.positions);
+                UVec3Buf tris = UVec3Buf(g.indices);
+                uint bStack[32];
+                int bSp = 0;
+                uint bNode = 0u;
+                for (;;) {
+                    const BvhNode bn = bNodes.n[bNode];
+                    if (bn.count > 0u) {
+                        for (uint j = 0u; j < bn.count; ++j) {
+                            const uint prim = bIdx.v[bn.leftFirst + j];
+                            const uvec3 tri = tris.v[prim];
+                            float ht;
+                            vec2 hbc;
+                            if (intersectTri(oro, ord, pos.v[tri.x], pos.v[tri.y], pos.v[tri.z], bestT, ht, hbc)) {
+                                if (g.alphaCutout != 0u && cutoutHole(int(sw.instanceId), int(prim), hbc)) continue;
+                                bestT = ht;
+                                h.instance = int(sw.instanceId);
+                                h.prim = int(prim);
+                                h.bc = hbc;
+                                h.t = ht;
+                                bestSw = swId;
+                            }
+                        }
+                        if (bSp == 0) break;
+                        bNode = bStack[--bSp];
+                    } else {
+                        const uint lc = bn.leftFirst;
+                        const uint rc = lc + 1u;
+                        const float dl = intersectAabb(oro, oInvRd, bNodes.n[lc].bmin, bNodes.n[lc].bmax, bestT);
+                        const float dr = intersectAabb(oro, oInvRd, bNodes.n[rc].bmin, bNodes.n[rc].bmax, bestT);
+                        if (dl < bestT && dr < bestT) {
+                            if (dl < dr) {
+                                bStack[bSp++] = rc;
+                                bNode = lc;
+                            } else {
+                                bStack[bSp++] = lc;
+                                bNode = rc;
+                            }
+                        } else if (dl < bestT) {
+                            bNode = lc;
+                        } else if (dr < bestT) {
+                            bNode = rc;
+                        } else {
+                            if (bSp == 0) break;
+                            bNode = bStack[--bSp];
+                        }
+                    }
+                }
+            }
+            if (tSp == 0) break;
+            tNode = tStack[--tSp];
+        } else {
+            const uint lc = tn.leftFirst;
+            const uint rc = lc + 1u;
+            const float dl = intersectAabb(ro, invRd, tNodes.n[lc].bmin, tNodes.n[lc].bmax, bestT);
+            const float dr = intersectAabb(ro, invRd, tNodes.n[rc].bmin, tNodes.n[rc].bmax, bestT);
+            if (dl < bestT && dr < bestT) {
+                if (dl < dr) {
+                    tStack[tSp++] = rc;
+                    tNode = lc;
+                } else {
+                    tStack[tSp++] = lc;
+                    tNode = rc;
+                }
+            } else if (dl < bestT) {
+                tNode = lc;
+            } else if (dr < bestT) {
+                tNode = rc;
+            } else {
+                if (tSp == 0) break;
+                tNode = tStack[--tSp];
+            }
+        }
+    }
+    if (h.instance < 0) return false;
+    const SwInstance bestInst = swInsts.d[bestSw];
+    h.o2w = toMat4x3(bestInst.objectToWorld);
+    h.w2o = toMat4x3(bestInst.worldToObject);
+    return true;
+}
+
+bool occluded(vec3 o, vec3 d, float tmax)
+{
+    if (fp.tlasNodes == 0ul) return false;
+    BvhNodeBuf tNodes = BvhNodeBuf(fp.tlasNodes);
+    UintROBuf tIdx = UintROBuf(fp.tlasIndices);
+    SwInstanceBuf swInsts = SwInstanceBuf(fp.swInstances);
+    GeometryBuf geoms = GeometryBuf(fp.geometries);
+    const vec3 invRd = safeInvRd(d);
+    if (intersectAabb(o, invRd, tNodes.n[0].bmin, tNodes.n[0].bmax, tmax) >= tmax) return false;
+
+    uint tStack[32];
+    int tSp = 0;
+    uint tNode = 0u;
+    for (;;) {
+        const BvhNode tn = tNodes.n[tNode];
+        if (tn.count > 0u) {
+            for (uint i = 0u; i < tn.count; ++i) {
+                const uint swId = tIdx.v[tn.leftFirst + i];
+                const SwInstance sw = swInsts.d[swId];
+                if ((sw.mask & kMaskSolid) == 0u) continue;
+                const GeometryData g = geoms.g[sw.geometry];
+                if (g.bvhNodes == 0ul) continue;
+
+                const vec3 oro = xformPoint12(sw.worldToObject, o);
+                const vec3 ord = xformVec12(sw.worldToObject, d);
+                const vec3 oInvRd = safeInvRd(ord);
+                BvhNodeBuf bNodes = BvhNodeBuf(g.bvhNodes);
+                if (intersectAabb(oro, oInvRd, bNodes.n[0].bmin, bNodes.n[0].bmax, tmax) >= tmax) continue;
+
+                UintROBuf bIdx = UintROBuf(g.bvhIndices);
+                Vec3Buf pos = Vec3Buf(g.positions);
+                UVec3Buf tris = UVec3Buf(g.indices);
+                uint bStack[32];
+                int bSp = 0;
+                uint bNode = 0u;
+                for (;;) {
+                    const BvhNode bn = bNodes.n[bNode];
+                    if (bn.count > 0u) {
+                        for (uint j = 0u; j < bn.count; ++j) {
+                            const uint prim = bIdx.v[bn.leftFirst + j];
+                            const uvec3 tri = tris.v[prim];
+                            float ht;
+                            vec2 hbc;
+                            if (intersectTri(oro, ord, pos.v[tri.x], pos.v[tri.y], pos.v[tri.z], tmax, ht, hbc)) {
+                                if (g.alphaCutout == 0u || !cutoutHole(int(sw.instanceId), int(prim), hbc))
+                                    return true;
+                            }
+                        }
+                        if (bSp == 0) break;
+                        bNode = bStack[--bSp];
+                    } else {
+                        const uint lc = bn.leftFirst;
+                        const uint rc = lc + 1u;
+                        const float dl = intersectAabb(oro, oInvRd, bNodes.n[lc].bmin, bNodes.n[lc].bmax, tmax);
+                        const float dr = intersectAabb(oro, oInvRd, bNodes.n[rc].bmin, bNodes.n[rc].bmax, tmax);
+                        if (dl < tmax && dr < tmax) {
+                            bStack[bSp++] = rc;
+                            bNode = lc;
+                        } else if (dl < tmax) {
+                            bNode = lc;
+                        } else if (dr < tmax) {
+                            bNode = rc;
+                        } else {
+                            if (bSp == 0) break;
+                            bNode = bStack[--bSp];
+                        }
+                    }
+                }
+            }
+            if (tSp == 0) break;
+            tNode = tStack[--tSp];
+        } else {
+            const uint lc = tn.leftFirst;
+            const uint rc = lc + 1u;
+            const float dl = intersectAabb(o, invRd, tNodes.n[lc].bmin, tNodes.n[lc].bmax, tmax);
+            const float dr = intersectAabb(o, invRd, tNodes.n[rc].bmin, tNodes.n[rc].bmax, tmax);
+            if (dl < tmax && dr < tmax) {
+                tStack[tSp++] = rc;
+                tNode = lc;
+            } else if (dl < tmax) {
+                tNode = lc;
+            } else if (dr < tmax) {
+                tNode = rc;
+            } else {
+                if (tSp == 0) break;
+                tNode = tStack[--tSp];
+            }
+        }
+    }
+    return false;
+}
+#else
 bool traceClosest(vec3 ro, vec3 rd, uint mask, out RawHit h)
 {
     rayQueryEXT q;
@@ -116,6 +381,7 @@ bool occluded(vec3 o, vec3 d, float tmax)
     }
     return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
 }
+#endif
 
 #if defined(CRTX_PICK)
 // ============================================================ sélection par rayon

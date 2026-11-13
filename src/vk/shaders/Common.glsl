@@ -75,7 +75,25 @@ struct GeometryData {
     uint64_t normals;
     uint64_t uvs;
     uint64_t indices;
+    uint64_t bvhNodes;
+    uint64_t bvhIndices;
     uint alphaCutout;
+    uint pad0;
+};
+
+struct BvhNode {
+    vec3 bmin;
+    uint leftFirst;
+    vec3 bmax;
+    uint count;
+};
+
+struct SwInstance {
+    float objectToWorld[12];
+    float worldToObject[12];
+    uint instanceId;
+    uint mask;
+    uint geometry;
     uint pad0;
 };
 
@@ -86,11 +104,14 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Mat
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer InstanceBuf { InstanceData d[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer GeometryBuf { GeometryData g[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer LightBuf { RectLight l[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer BvhNodeBuf { BvhNode n[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer SwInstanceBuf { SwInstance d[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 16) buffer Vec4Buf { vec4 v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer FloatBuf { float v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) buffer Vec2RWBuf { vec2 v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer IntBuf { int v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) buffer UintBuf { uint v[]; };
+layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer UintROBuf { uint v[]; };
 
 // Paramètres d'une image (miroir de VkFrameParams dans src/vk/VkRenderer.h)
 struct FrameParams {
@@ -104,6 +125,9 @@ struct FrameParams {
     uint64_t instances;   // InstanceBuf
     uint64_t lights;      // LightBuf
     uint64_t pickResult;  // IntBuf
+    uint64_t tlasNodes;   // BvhNodeBuf (mode logiciel CRTX_SW_RT)
+    uint64_t tlasIndices; // UintROBuf (mode logiciel CRTX_SW_RT)
+    uint64_t swInstances; // SwInstanceBuf (mode logiciel CRTX_SW_RT)
     CameraData cam;
     CameraData prevCam;
     uint width;
@@ -131,6 +155,12 @@ vec3 xformPoint12(float m[12], vec3 p)
 {
     return vec3(m[0] * p.x + m[1] * p.y + m[2] * p.z + m[3], m[4] * p.x + m[5] * p.y + m[6] * p.z + m[7],
                 m[8] * p.x + m[9] * p.y + m[10] * p.z + m[11]);
+}
+
+vec3 xformVec12(float m[12], vec3 v)
+{
+    return vec3(m[0] * v.x + m[1] * v.y + m[2] * v.z, m[4] * v.x + m[5] * v.y + m[6] * v.z,
+                m[8] * v.x + m[9] * v.y + m[10] * v.z);
 }
 
 #endif

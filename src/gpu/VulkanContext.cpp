@@ -206,7 +206,10 @@ bool VulkanContext::deviceSupports(VkPhysicalDevice d, const DeviceRequest& req,
     if (!f12.timelineSemaphore) return fail("sémaphores timeline absents");
     if (req.rayTracing) {
         if (!as.accelerationStructure || !rq.rayQuery) return fail("ray query non supporté");
+    }
+    if (req.rayTracing || req.bufferDeviceAddress) {
         if (!f12.bufferDeviceAddress || !f12.scalarBlockLayout) return fail("bufferDeviceAddress / scalarBlockLayout absents");
+        if (!f2.features.shaderInt64) return fail("shaderInt64 absent");
     }
     if (req.float64 && (!f2.features.shaderFloat64 || !f2.features.shaderInt64))
         return fail("shaderFloat64 / shaderInt64 absents (calcul double précision)");
@@ -246,7 +249,11 @@ void VulkanContext::pickPhysicalDevice(const DeviceRequest& req, int preferredIn
             best = d;
         }
     }
-    if (!best) throwError("Aucun GPU compatible (ray tracing Vulkan + FP64) :" + reasons, __FILE__, __LINE__);
+    if (!best) {
+        const char* what = req.rayTracing ? "Aucun GPU compatible (ray tracing Vulkan + FP64) :"
+                                          : "Aucun GPU compatible (Vulkan 1.2 + bufferDeviceAddress) :";
+        throwError(std::string(what) + reasons, __FILE__, __LINE__);
+    }
     setPhysical(best);
 }
 
@@ -335,6 +342,7 @@ void VulkanContext::createDevice(GLFWwindow* window, const DeviceRequest& req)
         *tail = &bdaExt;
         tail = &bdaExt.pNext;
     }
+    hasRayTracing_ = req.rayTracing;
     if (req.rayTracing) {
         *tail = &asf;
         asf.pNext = &rqf;
@@ -359,6 +367,7 @@ void VulkanContext::createDevice(GLFWwindow* window, const DeviceRequest& req)
     vkGetDeviceQueue(device_, queueFamily_, 0, &queue_);
     if (asyncCompute) vkGetDeviceQueue(device_, computeFamily_, 0, &computeQueue_);
 
+    hasRayTracing_ = req.rayTracing;
     if (req.rayTracing) {
         auto load = [&](auto& fn, const char* name) {
             fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(vkGetDeviceProcAddr(device_, name));

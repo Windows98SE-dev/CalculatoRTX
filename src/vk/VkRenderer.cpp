@@ -1,6 +1,7 @@
 // CalculatoRTX - moteur de rendu Vulkan (ray query + débruiteur + AMD FSR 1).
 #include "VkRenderer.h"
 
+#include "SwBvh.h"
 #include "VkShaders.h"
 
 #include <algorithm>
@@ -13,10 +14,10 @@ namespace {
 
 // Miroir de GeometryData (Common.glsl)
 struct GpuGeometry {
-    uint64_t positions, normals, uvs, indices;
+    uint64_t positions, normals, uvs, indices, bvhNodes, bvhIndices;
     uint32_t alphaCutout, pad0;
 };
-static_assert(sizeof(GpuGeometry) == 40, "GpuGeometry : disposition partagée avec les shaders");
+static_assert(sizeof(GpuGeometry) == 56, "GpuGeometry : disposition partagée avec les shaders");
 
 constexpr VkMemoryPropertyFlags kHost = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 constexpr VkMemoryPropertyFlags kDevice = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -27,14 +28,15 @@ VkDeviceSize alignUp(VkDeviceSize v, VkDeviceSize a) { return (v + a - 1) / a * 
 
 }  // namespace
 
-VkRenderer::VkRenderer(VulkanContext& vk) : vk_(vk)
+VkRenderer::VkRenderer(VulkanContext& vk) : vk_(vk), swRt_(!vk.hasRayTracing())
 {
     VkDevice dev = vk_.device();
-    const std::vector<VkDescriptorType> traceBindings = {VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
-                                                         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
-    trace_ = createComputePipeline(dev, g_spvPathTraceBlob(), traceBindings, 0);
-    pick_ = createComputePipeline(dev, g_spvPickBlob(), traceBindings, 0);
+    std::vector<VkDescriptorType> traceBindings;
+    if (!swRt_) traceBindings.push_back(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+    traceBindings.push_back(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    traceBindings.push_back(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+    trace_ = createComputePipeline(dev, swRt_ ? g_spvPathTraceSwBlob() : g_spvPathTraceBlob(), traceBindings, 0);
+    pick_ = createComputePipeline(dev, swRt_ ? g_spvPickSwBlob() : g_spvPickBlob(), traceBindings, 0);
     envBake_ = createComputePipeline(dev, g_spvEnvBakeBlob(), {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, 0);
     const uint32_t push = sizeof(PostPush);
     denoise_ = createComputePipeline(dev, g_spvDenoiseBlob(), {}, push);
@@ -69,8 +71,8 @@ VkRenderer::~VkRenderer()
     for (MeshGpu& m : meshes_) freeMesh(m);
     beginFrame();
     if (tlas_) vk_.rt().destroyAS(dev, tlas_, nullptr);
-    for (Buffer* b : {&tlasBuffer_, &tlasScratch_, &instanceBuffer_, &materials_, &geometries_, &instances_, &lights_,
-                      &frameUbo_, &pickBuf_})
+    for (Buffer* b : {&tlasBuffer_, &tlasScratch_, &instanceBuffer_, &tlasNodes_, &tlasIndices_, &swInstances_,
+                      &materials_, &geometries_, &instances_, &lights_, &frameUbo_, &pickBuf_})
         vk_.destroyBuffer(*b);
     freeFrameBuffers();
     if (queries_) vkDestroyQueryPool(dev, queries_, nullptr);
@@ -135,13 +137,14 @@ void VkRenderer::createEnvironment()
 void VkRenderer::createDescriptors()
 {
     VkDevice dev = vk_.device();
-    const VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2},
-                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2},
-                                          {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2}};
+    std::vector<VkDescriptorPoolSize> sizes;
+    if (!swRt_) sizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 2});
+    sizes.push_back({VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2});
+    sizes.push_back({VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2});
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = 2;
-    pci.poolSizeCount = 3;
-    pci.pPoolSizes = sizes;
+    pci.poolSizeCount = static_cast<uint32_t>(sizes.size());
+    pci.pPoolSizes = sizes.data();
     VK_CHECK(vkCreateDescriptorPool(dev, &pci, nullptr, &pool_));
     const VkDescriptorSetLayout layouts[2] = {trace_.setLayout, pick_.setLayout};
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -152,17 +155,19 @@ void VkRenderer::createDescriptors()
     VK_CHECK(vkAllocateDescriptorSets(dev, &ai, sets));
     traceSet_ = sets[0];
     pickSet_ = sets[1];
+    const uint32_t envBind = swRt_ ? 0u : 1u;
+    const uint32_t uboBind = swRt_ ? 1u : 2u;
     for (VkDescriptorSet s : sets) {
         VkDescriptorImageInfo ii{envSampler_, env_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorBufferInfo bi{frameUbo_.buffer, 0, sizeof(VkFrameParams)};
         VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstSet = s;
-        w[0].dstBinding = 1;
+        w[0].dstBinding = envBind;
         w[0].descriptorCount = 1;
         w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w[0].pImageInfo = &ii;
         w[1].dstSet = s;
-        w[1].dstBinding = 2;
+        w[1].dstBinding = uboBind;
         w[1].descriptorCount = 1;
         w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         w[1].pBufferInfo = &bi;
@@ -180,7 +185,8 @@ void VkRenderer::deferDestroy(Buffer& b)
 void VkRenderer::freeMesh(MeshGpu& m)
 {
     if (m.blas) pendingDestroyAs_.push_back(m.blas);
-    for (Buffer* b : {&m.positions, &m.normals, &m.uvs, &m.indices, &m.asBuffer}) deferDestroy(*b);
+    for (Buffer* b : {&m.positions, &m.normals, &m.uvs, &m.indices, &m.asBuffer, &m.bvhNodes, &m.bvhIndices})
+        deferDestroy(*b);
     m = MeshGpu{};
 }
 
@@ -226,8 +232,8 @@ void VkRenderer::buildMeshes(CalculatorScene& scene, VkCommandBuffer cmd)
 {
     auto& meshes = scene.meshes();
     if (meshes_.size() < meshes.size()) meshes_.resize(meshes.size());
-    const VkBufferUsageFlags geomUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    VkBufferUsageFlags geomUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (!swRt_) geomUsage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     std::vector<size_t> dirty;
     for (size_t i = 0; i < meshes.size(); ++i) {
         if (!meshes[i].dirty) continue;
@@ -243,10 +249,37 @@ void VkRenderer::buildMeshes(CalculatorScene& scene, VkCommandBuffer cmd)
             g.normals = uploadBuffer(cmd, m.normals.data(), sizeof(float3) * m.normals.size(), geomUsage);
         if (!m.uvs.empty()) g.uvs = uploadBuffer(cmd, m.uvs.data(), sizeof(float2) * m.uvs.size(), geomUsage);
         g.triangles = static_cast<uint32_t>(m.indices.size());
+        if (swRt_) {
+            std::vector<BvhPrim> prims(g.triangles);
+            for (uint32_t t = 0; t < g.triangles; ++t) {
+                const uint3 idx = m.indices[t];
+                const float3 p0 = m.positions[idx.x], p1 = m.positions[idx.y], p2 = m.positions[idx.z];
+                prims[t].bmin = make_float3(std::fmin(p0.x, std::fmin(p1.x, p2.x)),
+                                            std::fmin(p0.y, std::fmin(p1.y, p2.y)),
+                                            std::fmin(p0.z, std::fmin(p1.z, p2.z)));
+                prims[t].bmax = make_float3(std::fmax(p0.x, std::fmax(p1.x, p2.x)),
+                                            std::fmax(p0.y, std::fmax(p1.y, p2.y)),
+                                            std::fmax(p0.z, std::fmax(p1.z, p2.z)));
+                prims[t].centroid = (p0 + p1 + p2) * (1.0f / 3.0f);
+            }
+            std::vector<BvhNode> nodes;
+            std::vector<uint32_t> bvhIdx;
+            buildBvh(prims, nodes, bvhIdx, 2);
+            g.bmin = make_float3(nodes[0].minX, nodes[0].minY, nodes[0].minZ);
+            g.bmax = make_float3(nodes[0].maxX, nodes[0].maxY, nodes[0].maxZ);
+            g.bvhNodes = uploadBuffer(cmd, nodes.data(), sizeof(BvhNode) * nodes.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            g.bvhIndices =
+                uploadBuffer(cmd, bvhIdx.data(), sizeof(uint32_t) * bvhIdx.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        }
         dirty.push_back(i);
         geometryChanged_ = true;
     }
     if (dirty.empty()) return;
+    if (swRt_) {
+        VulkanContext::memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        return;
+    }
     VulkanContext::memoryBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                                  VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_ACCESS_SHADER_READ_BIT);
@@ -322,6 +355,57 @@ void VkRenderer::buildTlas(const CalculatorScene& scene, VkCommandBuffer cmd)
     if (prevTransforms_.size() != instances.size()) {
         prevTransforms_.resize(instances.size());
         for (size_t i = 0; i < instances.size(); ++i) prevTransforms_[i] = instances[i].transform;
+    }
+    if (swRt_) {
+        std::vector<SwInstance> swi;
+        std::vector<BvhPrim> tlasPrims;
+        std::vector<InstanceData> idata;
+        swi.reserve(instances.size());
+        tlasPrims.reserve(instances.size());
+        idata.reserve(instances.size());
+        for (size_t i = 0; i < instances.size(); ++i) {
+            const SceneInstance& si = instances[i];
+            if (si.mesh < 0 || si.mesh >= static_cast<int>(meshes_.size())) continue;
+            const MeshGpu& g = meshes_[si.mesh];
+            if (g.triangles == 0) continue;
+            SwInstance s{};
+            std::memcpy(s.objectToWorld, si.transform.m, sizeof(s.objectToWorld));
+            const Affine inv = invertAffine(si.transform);
+            std::memcpy(s.worldToObject, inv.m, sizeof(s.worldToObject));
+            s.instanceId = static_cast<uint32_t>(idata.size());
+            s.mask = si.mask & 0xFFu;
+            s.geometry = static_cast<uint32_t>(si.mesh);
+            swi.push_back(s);
+
+            BvhPrim bp{};
+            transformAabb(si.transform, g.bmin, g.bmax, bp.bmin, bp.bmax);
+            bp.centroid = (bp.bmin + bp.bmax) * 0.5f;
+            tlasPrims.push_back(bp);
+
+            InstanceData d{};
+            std::memcpy(d.prevObjectToWorld, prevTransforms_[i].m, sizeof(d.prevObjectToWorld));
+            d.geometry = si.mesh;
+            d.material = si.material;
+            d.pickId = si.pickId;
+            d.lightIndex = si.lightIndex;
+            d.glow = si.glow;
+            d.glowColor = si.glowColor;
+            idata.push_back(d);
+            prevTransforms_[i] = si.transform;
+        }
+        std::vector<BvhNode> tnodes;
+        std::vector<uint32_t> tidx;
+        buildBvh(tlasPrims, tnodes, tidx, 1);
+        const size_t n = std::max<size_t>(idata.size(), 1);
+        ensureHostBuffer(instances_, sizeof(InstanceData) * n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (!idata.empty()) std::memcpy(instances_.mapped, idata.data(), sizeof(InstanceData) * idata.size());
+        ensureHostBuffer(swInstances_, sizeof(SwInstance) * n, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (!swi.empty()) std::memcpy(swInstances_.mapped, swi.data(), sizeof(SwInstance) * swi.size());
+        ensureHostBuffer(tlasNodes_, sizeof(BvhNode) * std::max<size_t>(tnodes.size(), 1), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (!tnodes.empty()) std::memcpy(tlasNodes_.mapped, tnodes.data(), sizeof(BvhNode) * tnodes.size());
+        ensureHostBuffer(tlasIndices_, sizeof(uint32_t) * std::max<size_t>(tidx.size(), 1), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        if (!tidx.empty()) std::memcpy(tlasIndices_.mapped, tidx.data(), sizeof(uint32_t) * tidx.size());
+        return;
     }
     std::vector<VkAccelerationStructureInstanceKHR> vi;
     std::vector<InstanceData> idata;
@@ -423,7 +507,8 @@ void VkRenderer::syncScene(CalculatorScene& scene, VkCommandBuffer cmd)
     std::vector<GpuGeometry> geo(meshes_.size());
     for (size_t i = 0; i < meshes_.size(); ++i) {
         geo[i] = GpuGeometry{meshes_[i].positions.address, meshes_[i].normals.address, meshes_[i].uvs.address,
-                             meshes_[i].indices.address, meshes_[i].alpha ? 1u : 0u, 0u};
+                             meshes_[i].indices.address, meshes_[i].bvhNodes.address, meshes_[i].bvhIndices.address,
+                             meshes_[i].alpha ? 1u : 0u, 0u};
     }
     ensureHostBuffer(geometries_, sizeof(GpuGeometry) * std::max<size_t>(geo.size(), 1), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memcpy(geometries_.mapped, geo.data(), sizeof(GpuGeometry) * geo.size());
@@ -498,6 +583,9 @@ void VkRenderer::writeParams(const VkFrameDesc& f)
     p.instances = instances_.address;
     p.lights = lights_.address;
     p.pickResult = pickBuf_.address;
+    p.tlasNodes = tlasNodes_.address;
+    p.tlasIndices = tlasIndices_.address;
+    p.swInstances = swInstances_.address;
     p.cam = f.camera;
     p.prevCam = f.prevCamera;
     p.width = renderW_;

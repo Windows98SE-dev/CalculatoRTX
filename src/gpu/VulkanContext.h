@@ -52,6 +52,7 @@ struct DeviceRequest {
     bool cudaInterop = false;  // mémoire / sémaphores exportables (backend NVIDIA)
     bool rayTracing = false;   // VK_KHR_acceleration_structure + VK_KHR_ray_query
     bool float64 = false;      // shaderFloat64 + shaderInt64 (moteur de calcul Vulkan)
+    bool bufferDeviceAddress = false;  // bufferDeviceAddress + scalarBlockLayout + shaderInt64
     std::vector<std::string> extraExtensions;  // ex. extensions exigées par NGX/DLSS
 };
 
@@ -144,6 +145,7 @@ public:
     const std::string& deviceName() const { return deviceName_; }
     uint32_t vendorId() const { return vendorId_; }
     bool isDiscrete() const { return discrete_; }
+    bool hasRayTracing() const { return hasRayTracing_; }
     const VkPhysicalDeviceLimits& limits() const { return limits_; }
     float timestampPeriodNs() const { return limits_.timestampPeriod; }
     const RayTracingFns& rt() const { return rt_; }
@@ -169,6 +171,7 @@ private:
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     bool headless_ = false;
     bool bufferDeviceAddress_ = false;
+    bool hasRayTracing_ = false;
 
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkExtent2D swapExtent_{};
