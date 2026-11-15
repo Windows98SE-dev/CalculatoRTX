@@ -132,7 +132,7 @@ crtx_shader(g_spvTemporal Temporal.comp)
 # ----------------------------------------------------------------------------- avertissements communs
 function(crtx_warnings target)
     target_compile_options(${target} PRIVATE
-        $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W3 /utf-8 /permissive- /MP>
+        $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/W3 /utf-8 /permissive- /Zc:preprocessor /MP>
         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-Wall -Wextra -Wno-missing-field-initializers>)
     target_compile_definitions(${target} PRIVATE
         $<$<PLATFORM_ID:Windows>:NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS>)
@@ -264,7 +264,7 @@ if(CRTX_WITH_CUDA)
         --use_fast_math
         --generate-line-info
         -Wno-deprecated-gpu-targets
-        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/utf-8>)
+        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/utf-8,/Zc:preprocessor>)
     set(CRTX_EMBEDDED_PTX "${CRTX_GEN_DIR}/optix_programs_ptx.cpp")
     add_custom_command(
         OUTPUT "${CRTX_EMBEDDED_PTX}"
@@ -289,7 +289,7 @@ if(CRTX_WITH_CUDA)
     set_source_files_properties(src/render/Kernels.cu PROPERTIES COMPILE_OPTIONS "--use_fast_math")
     target_compile_options(crtx_nvidia PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets --extended-lambda>
-        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8>)
+        $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CXX_COMPILER_ID:MSVC>>:-Xcompiler=/utf-8,/Zc:preprocessor>)
     if(CRTX_WITH_DLSS)
         target_compile_definitions(crtx_nvidia PRIVATE CRTX_WITH_DLSS=1)
         target_include_directories(crtx_nvidia PRIVATE "${DLSS_INCLUDE_DIR}")
